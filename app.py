@@ -4,18 +4,15 @@ import pandas as pd
 import pandas_ta as ta
 import plotly.graph_objects as go
 from xgboost import XGBClassifier
-from sklearn.neural_network import MLPClassifier
-from sklearn.ensemble import VotingClassifier
-from sklearn.preprocessing import StandardScaler
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import numpy as np
 
 # ==========================================
 # 1. APP CONFIGURATION
 # ==========================================
 st.set_page_config(
-    page_title="Hybrid Sniper Bot",
-    page_icon="🧬",
+    page_title="Sniper Bot Command Center",
+    page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -24,316 +21,308 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stMetric {
-        background-color: #0E1117;
+        background-color: #1E1E1E;
         border: 1px solid #333;
-        padding: 15px;
-        border-radius: 8px;
+        padding: 10px;
+        border-radius: 5px;
     }
     .stDataFrame {
         border: 1px solid #333;
         border-radius: 5px;
     }
-    .ai-tag {
-        color: #00CCFF;
-        font-weight: bold;
-        border: 1px solid #00CCFF;
-        padding: 5px;
-        border-radius: 5px;
-        margin-top: 10px;
-    }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🧬 Hybrid Sniper | Standard Risk (1:2)")
+st.title("🎯 Sniper Bot | Live Execution Terminal")
 
 # ==========================================
 # 2. SIDEBAR CONTROLS
 # ==========================================
 st.sidebar.header("⚙️ Configuration")
 
+# --- ASSET LIST ---
 asset_map = {
+    # Crypto
     "Bitcoin (BTC-USD)": "BTC-USD",
     "Ethereum (ETH-USD)": "ETH-USD",
-    "Gold (GC=F)": "GC=F",
+    
+    # Forex
+    "Gold (XAU/USD)": "GC=F",
     "EUR/USD": "EURUSD=X",
     "USD/JPY": "JPY=X",
     "GBP/JPY": "GBPJPY=X",
+    
+    # Indices
     "US30 (Dow Jones)": "^DJI",
     "US500 (S&P 500)": "^GSPC",
     "German Index (DAX)": "^GDAXI",
+    "Japan Index (Nikkei 225)": "^N225"
 }
 
 selected_asset = st.sidebar.selectbox("Select Asset", list(asset_map.keys()))
 SYMBOL = asset_map[selected_asset]
 
-EXEC_INTERVAL = st.sidebar.selectbox("Execution Timeframe", ["5m", "15m", "1h"], index=0)
+# --- NEW: TIMEFRAME SELECTION ---
+INTERVAL = st.sidebar.selectbox("Execution Timeframe", ["1h", "30m", "15m"], index=0)
 
-if EXEC_INTERVAL in ["5m", "15m"]:
+# --- NEW: PERIOD LOGIC (Max 59 days for Intraday) ---
+# Yahoo Finance limits 15m/30m data to the last 60 days. 
+# We set it to "59d" to be safe and compliant with your "less than 2 months" request.
+if INTERVAL in ["15m", "30m"]:
+    st.sidebar.info(f"⚠️ {INTERVAL} data is limited to last 59 days by Exchange.")
     PERIOD = "59d"
-    st.sidebar.warning(f"⚠️ {EXEC_INTERVAL} data is limited to last 60 days.")
 else:
-    PERIOD = st.sidebar.select_slider("Data Lookback", options=["3mo", "6mo", "1y", "2y"], value="6mo")
+    # For 1h, we give the option, but keep it low as requested
+    PERIOD = st.sidebar.select_slider("Data Lookback", options=["1mo", "59d"], value="59d")
 
 CONFIDENCE = st.sidebar.slider("Min Confidence %", 50, 95, 65) / 100
-RR_RATIO_STR = st.sidebar.select_slider("Risk:Reward Target", options=["1:1.5", "1:2", "1:3", "1:4"], value="1:2")
-TARGET_RR = float(RR_RATIO_STR.split(":")[1])
+RR_RATIO_STR = st.sidebar.select_slider("Risk:Reward Target", options=["1:1", "1:1.5", "1:2", "1:3"], value="1:2")
 STARTING_CAPITAL = 10000
 
+# Parse RR Ratio
+TARGET_RR = float(RR_RATIO_STR.split(":")[1])
+
 st.sidebar.markdown("---")
-st.sidebar.markdown("""
-<div class='ai-tag'>
-🧠 <b>Dual-Brain Logic:</b><br>
-• Model 1: <b>XGBoost</b> (Trees)<br>
-• Model 2: <b>Neural Network</b> (MLP)<br>
-• Consensus: <b>Voting Classifier</b>
-</div>
-""", unsafe_allow_html=True)
+st.sidebar.caption(f"Strategy: **XGBoost Trend + Session Filter**")
 
 # ==========================================
-# 3. DATA ENGINE
+# 3. BACKEND ENGINE
 # ==========================================
 @st.cache_data(ttl=60)
-def fetch_and_merge_data(ticker, period, exec_interval):
+def fetch_market_data(ticker, period, interval):
     try:
-        # 1. Exec Data
-        df_exec = yf.download(ticker, period=period, interval=exec_interval, progress=False)
-        if df_exec.empty: return pd.DataFrame()
-        if isinstance(df_exec.columns, pd.MultiIndex): df_exec.columns = df_exec.columns.get_level_values(0)
+        data = yf.download(ticker, period=period, interval=interval, progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
         
-        # 2. Confirmation Data
-        df_1h = yf.download(ticker, period="1y", interval="1h", progress=False)
-        if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.get_level_values(0)
+        # Calculate Indicators
+        data['RSI'] = ta.rsi(data['Close'], length=14)
+        data['MACD'] = ta.macd(data['Close'])['MACD_12_26_9']
+        data['ATR'] = ta.atr(data['High'], data['Low'], data['Close'], length=14)
+        data['SMA_50'] = ta.sma(data['Close'], length=50)
+        data['SMA_200'] = ta.sma(data['Close'], length=200)
         
-        df_4h = yf.download(ticker, period="1y", interval="1h", progress=False)
-        if isinstance(df_4h.columns, pd.MultiIndex): df_4h.columns = df_4h.columns.get_level_values(0)
-        df_4h = df_4h.resample('4h').agg({'Open':'first', 'High':'max', 'Low':'min', 'Close':'last'}).dropna()
-
-        # 3. Indicators
-        def calc_ind(df, suffix=""):
-            df[f'RSI{suffix}'] = ta.rsi(df['Close'], length=14)
-            df[f'EMA50{suffix}'] = ta.ema(df['Close'], length=50)
-            df[f'EMA200{suffix}'] = ta.ema(df['Close'], length=200)
-            df[f'Trend{suffix}'] = np.where(df[f'EMA50{suffix}'] > df[f'EMA200{suffix}'], 1, -1)
-            return df
-
-        df_exec = calc_ind(df_exec, "")
-        df_1h = calc_ind(df_1h, "_1h")
-        df_4h = calc_ind(df_4h, "_4h")
-        df_exec['ATR'] = ta.atr(df_exec['High'], df_exec['Low'], df_exec['Close'], length=14)
-
-        # 4. Merge
-        df_exec = df_exec.sort_index()
-        df_1h = df_1h.sort_index()
-        df_4h = df_4h.sort_index()
-
-        df_merged = pd.merge_asof(df_exec, df_1h[['RSI_1h', 'Trend_1h']], left_index=True, right_index=True, direction='backward')
-        df_merged = pd.merge_asof(df_merged, df_4h[['RSI_4h', 'Trend_4h']], left_index=True, right_index=True, direction='backward')
-
-        # 5. Session
-        df_merged['Hour'] = df_merged.index.hour
-        df_merged['Session'] = "ASIAN"
-        df_merged.loc[(df_merged['Hour'] >= 7) & (df_merged['Hour'] <= 16), 'Session'] = "LON"
-        df_merged.loc[(df_merged['Hour'] >= 13) & (df_merged['Hour'] <= 21), 'Session'] = "NY"
-
-        df_merged.dropna(inplace=True)
-        return df_merged
-
+        # Session Filter (UTC Hours)
+        data['Hour'] = data.index.hour
+        data['Session'] = "ASIAN"
+        data.loc[(data['Hour'] >= 7) & (data['Hour'] <= 16), 'Session'] = "LON"
+        data.loc[(data['Hour'] >= 13) & (data['Hour'] <= 21), 'Session'] = "NY"
+        
+        data.dropna(inplace=True)
+        return data
     except Exception as e:
         return pd.DataFrame()
 
-with st.spinner(f"Fetching Data ({EXEC_INTERVAL})..."):
-    df = fetch_and_merge_data(SYMBOL, PERIOD, EXEC_INTERVAL)
+with st.spinner(f"Fetching {PERIOD} of {INTERVAL} Data for {SYMBOL}..."):
+    df = fetch_market_data(SYMBOL, PERIOD, INTERVAL)
 
 if df.empty:
-    st.error("❌ Data Fetch Failed. Yahoo API throttling or invalid ticker.")
+    st.error(f"❌ Connection Failed. Market data for {SYMBOL} is unavailable (Market might be closed or API limit reached).")
     st.stop()
 
 # ==========================================
-# 4. HYBRID AI & STANDARD BACKTEST
+# 4. AI & ADVANCED BACKTEST ENGINE
 # ==========================================
 def run_simulation(df, threshold, target_rr):
-    # Features
-    features = ['RSI', 'RSI_1h', 'RSI_4h', 'Trend_1h', 'Trend_4h', 'ATR']
+    # 1. Prepare Data
     df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
+    features = ['RSI', 'MACD', 'ATR']
     
-    # Train/Test Split
-    split_idx = int(len(df) * 0.8)
-    train_df = df.iloc[:split_idx]
-    test_df = df.iloc[split_idx:]
+    # 2. Train Model
+    X = df[features].iloc[:-1]
+    y = df['Target'].iloc[:-1]
     
-    # Scaling
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(train_df[features])
-    y_train = train_df['Target']
-    X_test = scaler.transform(test_df[features])
+    model = XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.05, eval_metric='logloss')
+    model.fit(X, y)
     
-    # --- MODELS ---
-    clf1 = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
-    clf2 = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, eval_metric='logloss')
-    model = VotingClassifier(estimators=[('nn', clf1), ('xgb', clf2)], voting='soft')
-    model.fit(X_train, y_train)
+    # 3. Get Probabilities
+    all_probs = model.predict_proba(df[features]) 
     
-    # Live Signal
-    last_candle = df[features].iloc[[-1]]
-    last_candle_scaled = scaler.transform(last_candle)
-    live_probs = model.predict_proba(last_candle_scaled)[0]
-    live_buy_conf = live_probs[1]
-    live_sell_conf = live_probs[0]
+    # 4. Live Signal
+    live_prob_buy = all_probs[-1][1]
+    live_prob_sell = all_probs[-1][0]
     
-    # --- BACKTEST (Standard Risk) ---
-    test_probs = model.predict_proba(X_test)
+    # 5. Run Realistic Backtest (High/Low Check)
     trades = []
-    final_balance = STARTING_CAPITAL
     
-    i = 0
-    while i < len(test_df) - 1:
-        if test_df['Session'].iloc[i] == "ASIAN": 
-            i += 1
-            continue
+    # Skip first 50 candles for indicators to settle
+    start_idx = 50
+    if len(df) < 50: start_idx = 0
+
+    for i in range(start_idx, len(df)-1):
+        # Data for Decision
+        session = df['Session'].iloc[i]
+        if session == "ASIAN": continue # Skip Asian
             
-        prob_buy = test_probs[i][1]
-        prob_sell = test_probs[i][0]
+        prob_buy = all_probs[i][1]
+        prob_sell = all_probs[i][0]
+        atr = df['ATR'].iloc[i]
         
         action = "WAIT"
         if prob_buy > threshold: action = "BUY"
         elif prob_sell > threshold: action = "SELL"
-        
-        if action == "WAIT":
-            i += 1
-            continue
             
-        # Trade Setup
-        entry_idx = i + 1
-        if entry_idx >= len(test_df): break
-        
-        entry_price = test_df['Open'].iloc[entry_idx]
-        atr = test_df['ATR'].iloc[i]
-        
-        # Standard Risk Settings (1x Risk, Targetx Reward)
-        risk_dist = atr * 1.0
-        reward_dist = atr * target_rr
-        
-        sl_price = entry_price - risk_dist if action == "BUY" else entry_price + risk_dist
-        tp_price = entry_price + reward_dist if action == "BUY" else entry_price - reward_dist
-        
-        exit_reason = "End of Data"
-        rr_realized = 0.0
-        
-        j = entry_idx
-        while j < len(test_df):
-            curr_high = test_df['High'].iloc[j]
-            curr_low = test_df['Low'].iloc[j]
-            curr_close = test_df['Close'].iloc[j]
+        if action != "WAIT":
+            # Trade Parameters
+            entry_price = df['Open'].iloc[i+1]
+            risk_dist = atr * 1.0 # Stop Loss Distance
+            reward_dist = atr * target_rr # Take Profit Distance
             
-            # SL Check
-            sl_hit = False
-            if action == "BUY" and curr_low <= sl_price: sl_hit = True
-            elif action == "SELL" and curr_high >= sl_price: sl_hit = True
+            sl_price = 0
+            tp_price = 0
             
-            if sl_hit:
-                exit_reason = "SL Hit"
-                rr_realized = -1.0
-                break
+            if action == "BUY":
+                sl_price = entry_price - risk_dist
+                tp_price = entry_price + reward_dist
+            else: # SELL
+                sl_price = entry_price + risk_dist
+                tp_price = entry_price - reward_dist
             
-            # TP Check
-            tp_hit = False
-            if action == "BUY" and curr_high >= tp_price: tp_hit = True
-            elif action == "SELL" and curr_low <= tp_price: tp_hit = True
+            # Check Outcome on NEXT Candle
+            next_high = df['High'].iloc[i+1]
+            next_low = df['Low'].iloc[i+1]
+            next_close = df['Close'].iloc[i+1]
             
-            if tp_hit:
-                exit_reason = "TP Hit"
-                rr_realized = target_rr
-                break
-                
-            # Time Exit (48 candles)
-            if (j - entry_idx) > 48:
-                pnl_dist = (curr_close - entry_price) if action == "BUY" else (entry_price - curr_close)
-                rr_realized = pnl_dist / risk_dist
-                exit_reason = "Time Exit"
-                break
-            j += 1
+            result = "EXIT"
+            pnl = 0
+            achieved_rr = 0.0
             
-        # Update Balance
-        risk_dollars = final_balance * 0.02
-        pnl_dollars = risk_dollars * rr_realized
-        final_balance += pnl_dollars
-        
-        trades.append({
-            "Date": test_df.index[entry_idx].strftime('%m-%d %H:%M'),
-            "Type": action,
-            "Price": entry_price,
-            "SL": sl_price,
-            "TP": tp_price,
-            "Result": exit_reason,
-            "Net R": rr_realized,
-            "PnL": pnl_dollars
-        })
-        i = j + 1
+            # Logic: Did we hit TP or SL?
+            if action == "BUY":
+                if next_low <= sl_price:
+                    result = "SL HIT"
+                    pnl = -risk_dist
+                    achieved_rr = -1.0
+                elif next_high >= tp_price:
+                    result = "TP HIT"
+                    pnl = reward_dist
+                    achieved_rr = target_rr
+                else:
+                    pnl = next_close - entry_price
+                    achieved_rr = pnl / risk_dist
             
+            elif action == "SELL":
+                if next_high >= sl_price:
+                    result = "SL HIT"
+                    pnl = -risk_dist
+                    achieved_rr = -1.0
+                elif next_low <= tp_price:
+                    result = "TP HIT"
+                    pnl = reward_dist
+                    achieved_rr = target_rr
+                else:
+                    pnl = entry_price - next_close
+                    achieved_rr = pnl / risk_dist
+
+            trades.append({
+                "Date": df.index[i].strftime('%Y-%m-%d %H:%M'),
+                "Type": action,
+                "Entry": entry_price,
+                "SL": sl_price,
+                "TP": tp_price,
+                "Result": result,
+                "RR Achieved": achieved_rr,
+                "PnL": pnl
+            })
+            
+    # Calculate Summary Stats
+    total_trades = len(trades)
     win_rate = 0
-    if len(trades) > 0:
+    final_balance = STARTING_CAPITAL
+    
+    if total_trades > 0:
         wins = sum(1 for t in trades if t['PnL'] > 0)
-        win_rate = (wins / len(trades)) * 100
+        win_rate = (wins / total_trades) * 100
         
-    return live_buy_conf, live_sell_conf, pd.DataFrame(trades), final_balance, win_rate
+        for t in trades:
+             # Dynamic Position Sizing: Risk 2% of current balance
+             risk_amt = final_balance * 0.02
+             
+             # Calculate Change based on RR
+             if t['Result'] == "SL HIT":
+                 final_balance -= risk_amt
+             elif t['Result'] == "TP HIT":
+                 final_balance += (risk_amt * target_rr)
+             else:
+                 # Partial Result (Time Exit)
+                 final_balance += (risk_amt * t['RR Achieved'])
+                 
+    return live_prob_buy, live_prob_sell, pd.DataFrame(trades), final_balance, win_rate, total_trades
 
-live_buy, live_sell, trade_hist, end_bal, win_rate = run_simulation(df, CONFIDENCE, TARGET_RR)
+prob_buy, prob_sell, trade_history, final_bal, win_rate, total_trades = run_simulation(df, CONFIDENCE, TARGET_RR)
 
 # ==========================================
-# 5. DASHBOARD LAYOUT
+# 5. DASHBOARD UI
 # ==========================================
-c_hour = datetime.now(timezone.utc).hour
-c_session = "ASIAN (Sleep)"
-if 7 <= c_hour <= 16: c_session = "LONDON (Active)"
-elif 13 <= c_hour <= 21: c_session = "NEW YORK (Active)"
+current_hour = datetime.now(timezone.utc).hour
+current_session = "ASIAN (Sleep)"
+session_color = "off"
+if 7 <= current_hour <= 16:
+    current_session = "LONDON (Active)"
+    session_color = "normal"
+elif 13 <= current_hour <= 21:
+    current_session = "NEW YORK (Active)"
+    session_color = "normal"
 
 signal = "WAIT"
-if live_buy > CONFIDENCE: signal = "BUY"
-elif live_sell > CONFIDENCE: signal = "SELL"
+if prob_buy > CONFIDENCE:
+    signal = "BUY"
+elif prob_sell > CONFIDENCE:
+    signal = "SELL"
 
-# Top Metrics
-m1, m2, m3, m4 = st.columns(4)
-curr_price = df['Close'].iloc[-1]
-trend_4h = "BULLISH" if df['Trend_4h'].iloc[-1] == 1 else "BEARISH"
+# --- TOP METRICS ---
+col1, col2, col3, col4 = st.columns(4)
+current_price = df['Close'].iloc[-1]
+change = current_price - df['Open'].iloc[-1]
+atr = df['ATR'].iloc[-1]
 
-m1.metric("Live Price", f"${curr_price:,.2f}")
-m2.metric("4H Trend", trend_4h, delta="Filter", delta_color="normal")
-m3.metric("Hybrid Signal", signal, f"{max(live_buy, live_sell)*100:.1f}% Conf")
-m4.metric("Session", c_session)
+col1.metric("Live Price", f"${current_price:,.2f}", f"{change:.2f}")
+col2.metric("Current Session", current_session, delta_color=session_color)
+col3.metric("AI Signal", signal, f"{max(prob_buy, prob_sell)*100:.1f}% Conf")
+col4.metric("Risk (1 ATR)", f"${atr:.2f}")
 
-# Chart
-st.markdown("### 🧬 Hybrid Analysis (NN + XGB)")
+# --- CHART ---
+st.markdown("### 📊 Live Market Analysis")
 fig = go.Figure()
-fig.add_trace(go.Candlestick(x=df.index[-100:], open=df['Open'][-100:], high=df['High'][-100:], low=df['Low'][-100:], close=df['Close'][-100:], name="Price"))
+fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"))
+fig.add_trace(go.Scatter(x=df.index, y=df['SMA_50'], line=dict(color='orange', width=1), name="SMA 50"))
+fig.add_trace(go.Scatter(x=df.index, y=df['SMA_200'], line=dict(color='blue', width=1), name="SMA 200"))
+fig.update_layout(height=450, xaxis_rangeslider_visible=False, template="plotly_dark", margin=dict(l=0,r=0,t=0,b=0))
 st.plotly_chart(fig, use_container_width=True)
 
-# Execution
-col_exec, col_data = st.columns([2, 1])
-with col_exec:
-    st.info(f"**AI Logic:** Consensus between **Neural Network** (Patterns) and **XGBoost** (Logic).")
-    st.progress(float(live_buy))
-with col_data:
-    if st.button("🔄 SCAN NOW"): st.rerun()
+# --- EXECUTION PANEL ---
+c1, c2 = st.columns([2, 1])
+with c1:
+    bull_conf = float(prob_buy)
+    bear_conf = float(prob_sell)
+    st.info(f"**AI Prediction ({INTERVAL}):** {bull_conf*100:.1f}% Bullish vs {bear_conf*100:.1f}% Bearish")
+    st.progress(bull_conf)
+with c2:
+    if st.button("🔄 REFRESH DATA"):
+        st.rerun()
 
-# Backtest
+# --- PERFORMANCE SECTION ---
 st.markdown("---")
-st.subheader(f"🧪 Standard Backtest (Last 20% of {PERIOD})")
-b1, b2, b3, b4 = st.columns(4)
-b1.metric("End Balance", f"${end_bal:,.2f}", f"{(end_bal-STARTING_CAPITAL)/STARTING_CAPITAL*100:.1f}%")
-b2.metric("Win Rate", f"{win_rate:.1f}%")
-b3.metric("Trades", len(trade_hist))
-b4.metric("Strategy", f"Fixed 1:{TARGET_RR} RR")
+st.subheader(f"📈 Backtest Performance (Last {PERIOD})")
 
-if not trade_hist.empty:
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Final Balance", f"${final_bal:,.2f}", f"{(final_bal-STARTING_CAPITAL)/STARTING_CAPITAL*100:.1f}% Return")
+m2.metric("Win Rate", f"{win_rate:.1f}%")
+m3.metric("Total Trades", total_trades)
+m4.metric("Target RR", f"1:{TARGET_RR}")
+
+if not trade_history.empty:
     st.dataframe(
-        trade_hist.iloc[::-1],
-        use_container_width=True,
+        trade_history.sort_index(ascending=False),
+        use_container_width=True, 
         hide_index=True,
         column_config={
-            "Price": st.column_config.NumberColumn(format="%.2f"),
-            "SL": st.column_config.NumberColumn(format="%.2f"),
-            "TP": st.column_config.NumberColumn(format="%.2f"),
-            "Net R": st.column_config.NumberColumn(format="%.2f R"),
-            "PnL": st.column_config.NumberColumn(format="$%.2f"),
+            "Entry": st.column_config.NumberColumn("Entry", format="%.2f"),
+            "SL": st.column_config.NumberColumn("Stop Loss", format="%.2f"),
+            "TP": st.column_config.NumberColumn("Take Profit", format="%.2f"),
+            "RR Achieved": st.column_config.NumberColumn("Achieved RR", format="%.2f x"),
+            "Result": st.column_config.TextColumn("Outcome"),
         }
     )
+else:
+    st.warning("No trades found in this period matching your Confidence Threshold.")
