@@ -5,3 +5,4 @@ pandas_ta
 plotly
 xgboost
 scikit-learn
+ccxt
