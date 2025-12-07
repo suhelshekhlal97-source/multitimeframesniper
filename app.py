@@ -33,13 +33,6 @@ st.markdown("""
         border: 1px solid #333;
         border-radius: 5px;
     }
-    .risk-tag {
-        color: #00FF00;
-        font-weight: bold;
-        border: 1px solid #00FF00;
-        padding: 5px;
-        border-radius: 5px;
-    }
     .ai-tag {
         color: #00CCFF;
         font-weight: bold;
@@ -51,7 +44,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🧬 Hybrid Sniper | Neural Net + XGBoost")
+st.title("🧬 Hybrid Sniper | Standard Risk (1:2)")
 
 # ==========================================
 # 2. SIDEBAR CONTROLS
@@ -82,15 +75,12 @@ else:
     PERIOD = st.sidebar.select_slider("Data Lookback", options=["3mo", "6mo", "1y", "2y"], value="6mo")
 
 CONFIDENCE = st.sidebar.slider("Min Confidence %", 50, 95, 65) / 100
+RR_RATIO_STR = st.sidebar.select_slider("Risk:Reward Target", options=["1:1.5", "1:2", "1:3", "1:4"], value="1:2")
+TARGET_RR = float(RR_RATIO_STR.split(":")[1])
 STARTING_CAPITAL = 10000
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
-<div class='risk-tag'>
-🛡️ <b>Risk Logic:</b><br>
-• 50% Exit @ <b>1.5 RR</b><br>
-• 50% Exit @ <b>3.0 RR</b><br>
-</div>
 <div class='ai-tag'>
 🧠 <b>Dual-Brain Logic:</b><br>
 • Model 1: <b>XGBoost</b> (Trees)<br>
@@ -159,9 +149,9 @@ if df.empty:
     st.stop()
 
 # ==========================================
-# 4. HYBRID AI ENGINE (XGB + NN)
+# 4. HYBRID AI & STANDARD BACKTEST
 # ==========================================
-def run_simulation(df, threshold):
+def run_simulation(df, threshold, target_rr):
     # Features
     features = ['RSI', 'RSI_1h', 'RSI_4h', 'Trend_1h', 'Trend_4h', 'ATR']
     df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
@@ -171,20 +161,15 @@ def run_simulation(df, threshold):
     train_df = df.iloc[:split_idx]
     test_df = df.iloc[split_idx:]
     
-    # Scaling (Crucial for Neural Networks)
+    # Scaling
     scaler = StandardScaler()
     X_train = scaler.fit_transform(train_df[features])
     y_train = train_df['Target']
     X_test = scaler.transform(test_df[features])
     
-    # --- DEFINE MODELS ---
-    # 1. Neural Network (Pattern Recognition)
+    # --- MODELS ---
     clf1 = MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
-    
-    # 2. XGBoost (Decision Tree Logic)
     clf2 = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, eval_metric='logloss')
-    
-    # 3. Voting Classifier (Soft = Average of Probabilities)
     model = VotingClassifier(estimators=[('nn', clf1), ('xgb', clf2)], voting='soft')
     model.fit(X_train, y_train)
     
@@ -195,12 +180,11 @@ def run_simulation(df, threshold):
     live_buy_conf = live_probs[1]
     live_sell_conf = live_probs[0]
     
-    # --- BACKTEST ---
+    # --- BACKTEST (Standard Risk) ---
     test_probs = model.predict_proba(X_test)
     trades = []
     final_balance = STARTING_CAPITAL
     
-    # Stateful Trade Loop
     i = 0
     while i < len(test_df) - 1:
         if test_df['Session'].iloc[i] == "ASIAN": 
@@ -225,20 +209,15 @@ def run_simulation(df, threshold):
         entry_price = test_df['Open'].iloc[entry_idx]
         atr = test_df['ATR'].iloc[i]
         
-        sl_dist = atr * 1.0
-        tp1_dist = atr * 1.5
-        tp2_dist = atr * 3.0
+        # Standard Risk Settings (1x Risk, Targetx Reward)
+        risk_dist = atr * 1.0
+        reward_dist = atr * target_rr
         
-        sl_price = entry_price - sl_dist if action == "BUY" else entry_price + sl_dist
-        tp1_price = entry_price + tp1_dist if action == "BUY" else entry_price - tp1_dist
-        tp2_price = entry_price + tp2_dist if action == "BUY" else entry_price - tp2_dist
-        if action == "SELL": tp2_price = entry_price - tp2_dist
-
-        # Execution State
-        qty_remaining = 1.0
-        tp1_hit = False
-        trade_pnl_accum = 0.0
+        sl_price = entry_price - risk_dist if action == "BUY" else entry_price + risk_dist
+        tp_price = entry_price + reward_dist if action == "BUY" else entry_price - reward_dist
+        
         exit_reason = "End of Data"
+        rr_realized = 0.0
         
         j = entry_idx
         while j < len(test_df):
@@ -247,57 +226,46 @@ def run_simulation(df, threshold):
             curr_close = test_df['Close'].iloc[j]
             
             # SL Check
-            sl_triggered = False
-            if action == "BUY" and curr_low <= sl_price: sl_triggered = True
-            elif action == "SELL" and curr_high >= sl_price: sl_triggered = True
+            sl_hit = False
+            if action == "BUY" and curr_low <= sl_price: sl_hit = True
+            elif action == "SELL" and curr_high >= sl_price: sl_hit = True
             
-            if sl_triggered:
-                trade_pnl_accum -= (qty_remaining * 1.0) 
-                exit_reason = "SL Hit" if not tp1_hit else "TP1 then SL"
-                break 
+            if sl_hit:
+                exit_reason = "SL Hit"
+                rr_realized = -1.0
+                break
             
-            # TP1 Check
-            if not tp1_hit:
-                tp1_triggered = False
-                if action == "BUY" and curr_high >= tp1_price: tp1_triggered = True
-                elif action == "SELL" and curr_low <= tp1_price: tp1_triggered = True
+            # TP Check
+            tp_hit = False
+            if action == "BUY" and curr_high >= tp_price: tp_hit = True
+            elif action == "SELL" and curr_low <= tp_price: tp_hit = True
+            
+            if tp_hit:
+                exit_reason = "TP Hit"
+                rr_realized = target_rr
+                break
                 
-                if tp1_triggered:
-                    trade_pnl_accum += (0.5 * 1.5)
-                    qty_remaining = 0.5
-                    tp1_hit = True
-            
-            # TP2 Check
-            tp2_triggered = False
-            if action == "BUY" and curr_high >= tp2_price: tp2_triggered = True
-            elif action == "SELL" and curr_low <= tp2_price: tp2_triggered = True
-            
-            if tp2_triggered:
-                trade_pnl_accum += (0.5 * 3.0)
-                exit_reason = "Full TP (3R)"
-                break 
-                
-            # Time Exit (4 hours)
-            if (j - entry_idx) > 48: 
-                final_pnl_dist = (curr_close - entry_price) if action == "BUY" else (entry_price - curr_close)
-                final_r = final_pnl_dist / sl_dist
-                trade_pnl_accum += (qty_remaining * final_r)
+            # Time Exit (48 candles)
+            if (j - entry_idx) > 48:
+                pnl_dist = (curr_close - entry_price) if action == "BUY" else (entry_price - curr_close)
+                rr_realized = pnl_dist / risk_dist
                 exit_reason = "Time Exit"
                 break
             j += 1
             
+        # Update Balance
         risk_dollars = final_balance * 0.02
-        pnl_dollars = risk_dollars * trade_pnl_accum
+        pnl_dollars = risk_dollars * rr_realized
         final_balance += pnl_dollars
         
         trades.append({
             "Date": test_df.index[entry_idx].strftime('%m-%d %H:%M'),
             "Type": action,
             "Price": entry_price,
-            "TP1": tp1_price,
-            "TP2": tp2_price,
+            "SL": sl_price,
+            "TP": tp_price,
             "Result": exit_reason,
-            "Net R": trade_pnl_accum,
+            "Net R": rr_realized,
             "PnL": pnl_dollars
         })
         i = j + 1
@@ -309,7 +277,7 @@ def run_simulation(df, threshold):
         
     return live_buy_conf, live_sell_conf, pd.DataFrame(trades), final_balance, win_rate
 
-live_buy, live_sell, trade_hist, end_bal, win_rate = run_simulation(df, CONFIDENCE)
+live_buy, live_sell, trade_hist, end_bal, win_rate = run_simulation(df, CONFIDENCE, TARGET_RR)
 
 # ==========================================
 # 5. DASHBOARD LAYOUT
@@ -349,12 +317,12 @@ with col_data:
 
 # Backtest
 st.markdown("---")
-st.subheader(f"🧪 Split-Target Backtest (Last 20% of {PERIOD})")
+st.subheader(f"🧪 Standard Backtest (Last 20% of {PERIOD})")
 b1, b2, b3, b4 = st.columns(4)
 b1.metric("End Balance", f"${end_bal:,.2f}", f"{(end_bal-STARTING_CAPITAL)/STARTING_CAPITAL*100:.1f}%")
 b2.metric("Win Rate", f"{win_rate:.1f}%")
 b3.metric("Trades", len(trade_hist))
-b4.metric("Strategy", "1.5R / 3.0R Split")
+b4.metric("Strategy", f"Fixed 1:{TARGET_RR} RR")
 
 if not trade_hist.empty:
     st.dataframe(
@@ -363,9 +331,9 @@ if not trade_hist.empty:
         hide_index=True,
         column_config={
             "Price": st.column_config.NumberColumn(format="%.2f"),
-            "TP1": st.column_config.NumberColumn(label="Target 1", format="%.2f"),
-            "TP2": st.column_config.NumberColumn(label="Target 2", format="%.2f"),
-            "Net R": st.column_config.NumberColumn(label="Total R", format="%.2f R"),
+            "SL": st.column_config.NumberColumn(format="%.2f"),
+            "TP": st.column_config.NumberColumn(format="%.2f"),
+            "Net R": st.column_config.NumberColumn(format="%.2f R"),
             "PnL": st.column_config.NumberColumn(format="$%.2f"),
         }
     )
